@@ -1,0 +1,52 @@
+[spec]
+lang = "ja"
+
+[steering.backup]
+max = 10
+
+[[steering.types]]
+allowed_operations = [
+    "refresh",
+    "discover",
+]
+criteria = [
+    "Product Overview: Brief description of what the product is",
+    "Core Features: Bulleted list of main capabilities",
+    "Target Use Case: Specific scenarios the product addresses",
+    "Key Value Proposition: Unique benefits and differentiators",
+]
+name = "product"
+purpose = "Product overview and value proposition"
+
+[[steering.types]]
+allowed_operations = [
+    "refresh",
+    "discover",
+]
+criteria = [
+    "Architecture: High-level system design",
+    "Frontend: Frameworks, libraries, build tools (if applicable)",
+    "Backend: Language, framework, server technology (if applicable)",
+    "Development Environment: Required tools and setup",
+    "Common Commands: Frequently used development commands",
+    "Environment Variables: Key configuration variables",
+    "Port Configuration: Standard ports used by services",
+]
+name = "tech"
+purpose = "Technical stack and development environment"
+
+[[steering.types]]
+allowed_operations = [
+    "refresh",
+    "discover",
+]
+criteria = [
+    "Root Directory Organization: Top-level structure with descriptions",
+    "Subdirectory Structures: Detailed breakdown of key directories",
+    "Code Organization Patterns: How code is structured",
+    "File Naming Conventions: Standards for naming files and directories",
+    "Import Organization: How imports/dependencies are organized",
+    "Key Architectural Principles: Core design decisions and patterns",
+]
+name = "structure"
+purpose = "Code organization and project structure patterns"
