@@ -150,11 +150,11 @@ struct ObjectInfo {
 
 
 #ifndef kDriver_Name
-#define                             kDriver_Name                        "BlackHole"
+#define                             kDriver_Name                        "SpotifyHole"
 #endif
 
 #ifndef kPlugIn_BundleID
-#define                             kPlugIn_BundleID                    "audio.existential.BlackHole2ch"
+#define                             kPlugIn_BundleID                    "audio.existential.SpotifyHole2ch"
 #endif
 
 #ifndef kPlugIn_Icon
@@ -229,6 +229,11 @@ struct ObjectInfo {
 
 #ifndef kManufacturer_Name
 #define                             kManufacturer_Name                  "Existential Audio Inc."
+#endif
+
+// Client filtering configuration
+#ifndef kAllowedBundleID
+#define                             kAllowedBundleID                    "com.spotify.client"
 #endif
 
 #define                             kLatency_Frame_Size                 0
@@ -335,6 +340,20 @@ static const UInt32                 kDevice_SampleRatesSize             = sizeof
 #define                             kBytes_Per_Frame                    (kNumber_Of_Channels * kBytes_Per_Channel)
 #define                             kRing_Buffer_Frame_Size             ((65536 + kLatency_Frame_Size))
 static Float32*                     gRingBuffer = NULL;
+
+// Client filtering state
+#define                             kMaxClients                         32
+
+typedef struct {
+    UInt32      clientID;
+    pid_t       processID;
+    CFStringRef bundleID;  // CFRetain済み
+    Boolean     isActive;  // スロット使用中フラグ
+} BlackHole_ClientInfo;
+
+static BlackHole_ClientInfo         gClients[kMaxClients];
+static UInt32                       gClientCount = 0;
+static CFStringRef                  gAllowedBundleID = NULL;
 
 
 //==================================================================================================
@@ -777,9 +796,19 @@ static OSStatus	BlackHole_Initialize(AudioServerPlugInDriverRef inDriver, AudioS
 	//	set the box name directly as a last resort
 	if(gBox_Name == NULL)
 	{
-		gBox_Name = CFSTR("BlackHole Box");
+		gBox_Name = CFSTR("SpotifyHole Box");
 	}
-	
+
+	//	initialize client filtering
+	gAllowedBundleID = CFStringCreateWithCString(kCFAllocatorDefault, kAllowedBundleID, kCFStringEncodingUTF8);
+	for (UInt32 i = 0; i < kMaxClients; i++) {
+		gClients[i].isActive = false;
+		gClients[i].clientID = 0;
+		gClients[i].processID = 0;
+		gClients[i].bundleID = NULL;
+	}
+	gClientCount = 0;
+
 	//	calculate the host ticks per frame
 	struct mach_timebase_info theTimeBaseInfo;
 	mach_timebase_info(&theTimeBaseInfo);
@@ -793,6 +822,50 @@ static OSStatus	BlackHole_Initialize(AudioServerPlugInDriverRef inDriver, AudioS
 Done:
 	return theAnswer;
 }
+
+#pragma mark -
+#pragma mark Client Filtering Helper Functions
+
+// クライアント検索（ClientIDからインデックス取得）
+static SInt32 FindClientIndex(UInt32 inClientID)
+{
+	for (UInt32 i = 0; i < kMaxClients; i++) {
+		if (gClients[i].isActive && gClients[i].clientID == inClientID) {
+			return (SInt32)i;
+		}
+	}
+	return -1;
+}
+
+// 空きスロット検索
+static SInt32 FindFreeClientSlot(void)
+{
+	for (UInt32 i = 0; i < kMaxClients; i++) {
+		if (!gClients[i].isActive) {
+			return (SInt32)i;
+		}
+	}
+	return -1;
+}
+
+// Bundle ID比較（許可チェック）
+static Boolean IsClientAllowed(UInt32 inClientID)
+{
+	SInt32 index = FindClientIndex(inClientID);
+	if (index < 0) {
+		return false;  // クライアント未登録
+	}
+
+	CFStringRef clientBundle = gClients[index].bundleID;
+	if (clientBundle == NULL || gAllowedBundleID == NULL) {
+		return false;
+	}
+
+	return CFStringCompare(clientBundle, gAllowedBundleID, 0) == kCFCompareEqualTo;
+}
+
+#pragma mark -
+#pragma mark Device Management
 
 static OSStatus	BlackHole_CreateDevice(AudioServerPlugInDriverRef inDriver, CFDictionaryRef inDescription, const AudioServerPlugInClientInfo* inClientInfo, AudioObjectID* outDeviceObjectID)
 {
@@ -834,18 +907,56 @@ Done:
 static OSStatus	BlackHole_AddDeviceClient(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceObjectID, const AudioServerPlugInClientInfo* inClientInfo)
 {
 	//	This method is used to inform the driver about a new client that is using the given device.
-	//	This allows the device to act differently depending on who the client is. This driver does
-	//	not need to track the clients using the device, so we just check the arguments and return
-	//	successfully.
-	
-	#pragma unused(inClientInfo)
-	
+	//	This allows the device to act differently depending on who the client is. We now track
+	//	clients to enable application-specific filtering.
+
 	//	declare the local variables
 	OSStatus theAnswer = 0;
-	
+
 	//	check the arguments
 	FailWithAction(inDriver != gAudioServerPlugInDriverRef, theAnswer = kAudioHardwareBadObjectError, Done, "BlackHole_AddDeviceClient: bad driver reference");
 	FailWithAction(inDeviceObjectID != kObjectID_Device && inDeviceObjectID != kObjectID_Device2, theAnswer = kAudioHardwareBadObjectError, Done, "BlackHole_AddDeviceClient: bad device ID");
+	FailWithAction(inClientInfo == NULL, theAnswer = kAudioHardwareBadObjectError, Done, "BlackHole_AddDeviceClient: NULL client info");
+
+	//	acquire the mutex
+	pthread_mutex_lock(&gPlugIn_StateMutex);
+
+	//	find a free slot
+	SInt32 freeIndex = FindFreeClientSlot();
+	if (freeIndex < 0) {
+		DebugMsg("BlackHole_AddDeviceClient: client list full");
+		pthread_mutex_unlock(&gPlugIn_StateMutex);
+		theAnswer = kAudioHardwareIllegalOperationError;
+		goto Done;
+	}
+
+	//	store client information
+	gClients[freeIndex].clientID = inClientInfo->mClientID;
+	gClients[freeIndex].processID = inClientInfo->mProcessID;
+
+	//	copy bundle ID (CFRetain)
+	if (inClientInfo->mBundleID != NULL) {
+		gClients[freeIndex].bundleID = CFStringCreateCopy(kCFAllocatorDefault, inClientInfo->mBundleID);
+	} else {
+		gClients[freeIndex].bundleID = NULL;
+	}
+
+	gClients[freeIndex].isActive = true;
+	gClientCount++;
+
+	#if DEBUG
+	if (gClients[freeIndex].bundleID != NULL) {
+		char bundleStr[256];
+		CFStringGetCString(gClients[freeIndex].bundleID, bundleStr, sizeof(bundleStr), kCFStringEncodingUTF8);
+		DebugMsg("BlackHole_AddDeviceClient: Added client ID=%u, PID=%d, Bundle=%s",
+				 inClientInfo->mClientID, inClientInfo->mProcessID, bundleStr);
+	} else {
+		DebugMsg("BlackHole_AddDeviceClient: Added client ID=%u, PID=%d, Bundle=NULL (macOS Sequoia bug?)",
+				 inClientInfo->mClientID, inClientInfo->mProcessID);
+	}
+	#endif
+
+	pthread_mutex_unlock(&gPlugIn_StateMutex);
 
 Done:
 	return theAnswer;
@@ -854,17 +965,37 @@ Done:
 static OSStatus	BlackHole_RemoveDeviceClient(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceObjectID, const AudioServerPlugInClientInfo* inClientInfo)
 {
 	//	This method is used to inform the driver about a client that is no longer using the given
-	//	device. This driver does not track clients, so we just check the arguments and return
-	//	successfully.
-	
-	#pragma unused(inClientInfo)
-	
+	//	device. We now track and clean up client information.
+
 	//	declare the local variables
 	OSStatus theAnswer = 0;
-	
+
 	//	check the arguments
 	FailWithAction(inDriver != gAudioServerPlugInDriverRef, theAnswer = kAudioHardwareBadObjectError, Done, "BlackHole_RemoveDeviceClient: bad driver reference");
 	FailWithAction(inDeviceObjectID != kObjectID_Device && inDeviceObjectID != kObjectID_Device2, theAnswer = kAudioHardwareBadObjectError, Done, "BlackHole_RemoveDeviceClient: bad device ID");
+	FailWithAction(inClientInfo == NULL, theAnswer = kAudioHardwareBadObjectError, Done, "BlackHole_RemoveDeviceClient: NULL client info");
+
+	pthread_mutex_lock(&gPlugIn_StateMutex);
+
+	//	find and remove the client
+	SInt32 index = FindClientIndex(inClientInfo->mClientID);
+	if (index >= 0) {
+		//	release bundle ID
+		if (gClients[index].bundleID != NULL) {
+			CFRelease(gClients[index].bundleID);
+			gClients[index].bundleID = NULL;
+		}
+
+		//	clear the slot
+		gClients[index].isActive = false;
+		gClients[index].clientID = 0;
+		gClients[index].processID = 0;
+		gClientCount--;
+
+		DebugMsg("BlackHole_RemoveDeviceClient: Removed client ID=%u", inClientInfo->mClientID);
+	}
+
+	pthread_mutex_unlock(&gPlugIn_StateMutex);
 
 Done:
 	return theAnswer;
@@ -4310,17 +4441,28 @@ static OSStatus	BlackHole_StartIO(AudioServerPlugInDriverRef inDriver, AudioObje
 	//	increment the counter.
     
     DebugMsg("BlackHole_StartIO");
-	
-	#pragma unused(inClientID, inDeviceObjectID)
-	
+
 	//	declare the local variables
 	OSStatus theAnswer = 0;
-	
+
 	//	check the arguments
 	FailWithAction(inDriver != gAudioServerPlugInDriverRef, theAnswer = kAudioHardwareBadObjectError, Done, "BlackHole_StartIO: bad driver reference");
 	FailWithAction(inDeviceObjectID != kObjectID_Device && inDeviceObjectID != kObjectID_Device2, theAnswer = kAudioHardwareBadObjectError, Done, "BlackHole_StartIO: bad device ID");
     FailWithAction(inDeviceObjectID == kObjectID_Device && gDevice_IOIsRunning == UINT64_MAX, theAnswer = kAudioHardwareIllegalOperationError, Done, "BlackHole_StartIO: overflow error.");
     FailWithAction(inDeviceObjectID == kObjectID_Device2 && gDevice2_IOIsRunning == UINT64_MAX, theAnswer = kAudioHardwareIllegalOperationError, Done, "BlackHole_StartIO: overflow error.");
+
+	//	check if client is allowed (Spotify filtering)
+	pthread_mutex_lock(&gPlugIn_StateMutex);
+	Boolean allowed = IsClientAllowed(inClientID);
+	pthread_mutex_unlock(&gPlugIn_StateMutex);
+
+	if (!allowed) {
+		#if DEBUG
+		DebugMsg("BlackHole_StartIO: Client ID=%u not allowed (not Spotify)", inClientID);
+		#endif
+		theAnswer = kAudioHardwareIllegalOperationError;
+		goto Done;
+	}
 
 	//	we need to hold the state lock
 	pthread_mutex_lock(&gPlugIn_StateMutex);
@@ -4376,7 +4518,27 @@ static OSStatus	BlackHole_StopIO(AudioServerPlugInDriverRef inDriver, AudioObjec
         free(gRingBuffer);
         gRingBuffer = NULL;
     }
-	
+
+	//	clean up client filtering resources when last client stops
+	if (!gDevice_IOIsRunning && !gDevice2_IOIsRunning)
+	{
+		//	release all client bundle IDs
+		for (UInt32 i = 0; i < kMaxClients; i++) {
+			if (gClients[i].bundleID != NULL) {
+				CFRelease(gClients[i].bundleID);
+				gClients[i].bundleID = NULL;
+			}
+			gClients[i].isActive = false;
+		}
+		gClientCount = 0;
+
+		//	release allowed bundle ID
+		if (gAllowedBundleID != NULL) {
+			CFRelease(gAllowedBundleID);
+			gAllowedBundleID = NULL;
+		}
+	}
+
 	//	unlock the state lock
 	pthread_mutex_unlock(&gPlugIn_StateMutex);
 	
