@@ -4,26 +4,53 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-BlackHole is a macOS virtual audio loopback driver implementing the CoreAudio Hardware Abstraction Layer (HAL) plugin interface. The entire driver is a single C file (~4600 lines) that creates virtual audio devices allowing zero-latency audio routing between applications.
+**SpotifyHole** is a Spotify-exclusive fork of BlackHole, a macOS virtual audio loopback driver implementing the CoreAudio Hardware Abstraction Layer (HAL) plugin interface. The entire driver is a single C file (~4800 lines) that creates virtual audio devices allowing zero-latency audio routing between applications.
+
+### Key Differences from Original BlackHole
+
+- **Application Filtering**: Only allows Spotify (`com.spotify.client`) to use the audio device
+- **Other apps blocked**: Chrome, Safari, and all other applications are rejected with `kAudioHardwareIllegalOperationError`
+- **Driver name**: Renamed from "BlackHole" to "SpotifyHole" to avoid conflicts
+- **Bundle ID**: Changed to `audio.existential.SpotifyHole2ch`
 
 ## Essential Development Commands
 
-### Building the Driver
+### Building the SpotifyHole Driver
 
 ```bash
-# Debug build (with logging enabled)
-xcodebuild -project BlackHole.xcodeproj -configuration Debug -target BlackHole
+# Debug build (with logging enabled, Spotify-only filtering)
+xcodebuild \
+  -project BlackHole.xcodeproj \
+  -configuration Debug \
+  -target BlackHole \
+  CONFIGURATION_BUILD_DIR=build \
+  CODE_SIGN_IDENTITY="" \
+  CODE_SIGNING_REQUIRED=NO \
+  PRODUCT_NAME="SpotifyHole" \
+  PRODUCT_BUNDLE_IDENTIFIER="audio.existential.SpotifyHole2ch"
 
-# Release build
-xcodebuild -project BlackHole.xcodeproj -configuration Release -target BlackHole
-
-# Custom build with 64 channels
+# Release build (Spotify-only)
 xcodebuild \
   -project BlackHole.xcodeproj \
   -configuration Release \
   -target BlackHole \
-  PRODUCT_BUNDLE_IDENTIFIER=audio.existential.BlackHole64ch \
-  GCC_PREPROCESSOR_DEFINITIONS='$GCC_PREPROCESSOR_DEFINITIONS kNumber_Of_Channels=64'
+  CONFIGURATION_BUILD_DIR=build \
+  CODE_SIGN_IDENTITY="" \
+  CODE_SIGNING_REQUIRED=NO \
+  PRODUCT_NAME="SpotifyHole" \
+  PRODUCT_BUNDLE_IDENTIFIER="audio.existential.SpotifyHole2ch"
+
+# Change allowed application (e.g., Apple Music instead of Spotify)
+xcodebuild \
+  -project BlackHole.xcodeproj \
+  -configuration Debug \
+  -target BlackHole \
+  CONFIGURATION_BUILD_DIR=build \
+  CODE_SIGN_IDENTITY="" \
+  CODE_SIGNING_REQUIRED=NO \
+  PRODUCT_NAME="MusicHole" \
+  PRODUCT_BUNDLE_IDENTIFIER="audio.existential.MusicHole2ch" \
+  GCC_PREPROCESSOR_DEFINITIONS='$GCC_PREPROCESSOR_DEFINITIONS kAllowedBundleID=\"com.apple.Music\"'
 ```
 
 ### Testing
@@ -40,11 +67,19 @@ xcodebuild -project BlackHole.xcodeproj -scheme BlackHoleTests build
 ### Development Installation
 
 ```bash
-# 1. Build the driver (creates build/BlackHole.driver)
-xcodebuild -project BlackHole.xcodeproj -configuration Debug -target BlackHole CONFIGURATION_BUILD_DIR=build
+# 1. Build the driver (creates build/SpotifyHole.driver)
+xcodebuild \
+  -project BlackHole.xcodeproj \
+  -configuration Debug \
+  -target BlackHole \
+  CONFIGURATION_BUILD_DIR=build \
+  CODE_SIGN_IDENTITY="" \
+  CODE_SIGNING_REQUIRED=NO \
+  PRODUCT_NAME="SpotifyHole" \
+  PRODUCT_BUNDLE_IDENTIFIER="audio.existential.SpotifyHole2ch"
 
 # 2. Install to system location (requires sudo)
-sudo cp -R build/BlackHole.driver /Library/Audio/Plug-Ins/HAL/
+sudo cp -R build/SpotifyHole.driver /Library/Audio/Plug-Ins/HAL/
 
 # 3. Restart CoreAudio to load the driver
 sudo killall -9 coreaudiod
@@ -65,14 +100,60 @@ system_profiler SPAudioDataType
 
 ### Single-File Driver Design
 
-BlackHole is intentionally implemented as a monolithic C file (`BlackHole/BlackHole.c`) implementing the `AudioServerPlugInDriverInterface`. This design choice simplifies distribution and compilation while maintaining all driver logic in one location.
+SpotifyHole is intentionally implemented as a monolithic C file (`BlackHole/BlackHole.c`) implementing the `AudioServerPlugInDriverInterface`. This design choice simplifies distribution and compilation while maintaining all driver logic in one location.
 
 **Key entry points:**
 - `BlackHole_Create()`: Plugin factory function called by CoreAudio
-- `BlackHole_Initialize()`: Sets up plugin state and host communication
+- `BlackHole_Initialize()`: Sets up plugin state, host communication, and client filtering
 - `BlackHole_CreateDevice()`: Called when devices are instantiated
-- `BlackHole_StartIO()` / `BlackHole_StopIO()`: I/O lifecycle management
+- `BlackHole_AddDeviceClient()` / `BlackHole_RemoveDeviceClient()`: Client tracking for application filtering
+- `BlackHole_StartIO()` / `BlackHole_StopIO()`: I/O lifecycle management with permission checks
 - `BlackHole_DoIOOperation()`: Core audio I/O processing (read/write to ring buffer)
+
+### Application Filtering (SpotifyHole-specific)
+
+SpotifyHole implements client-based filtering to restrict audio routing to Spotify only:
+
+**Data Structures** (lines 344-356):
+```c
+#define kMaxClients 32
+#define kAllowedBundleID "com.spotify.client"
+
+typedef struct {
+    UInt32      clientID;
+    pid_t       processID;
+    CFStringRef bundleID;  // CFRetain済み
+    Boolean     isActive;
+} BlackHole_ClientInfo;
+
+static BlackHole_ClientInfo gClients[kMaxClients];
+static CFStringRef gAllowedBundleID;
+```
+
+**Client Tracking Flow:**
+1. `BlackHole_AddDeviceClient()` (line 907): Stores client info (bundle ID, process ID) when app connects
+2. `BlackHole_StartIO()` (line 4454): Checks if client's bundle ID matches `com.spotify.client`
+3. If not Spotify: Returns `kAudioHardwareIllegalOperationError` (blocks audio)
+4. `BlackHole_RemoveDeviceClient()` (line 965): Cleans up client info and releases bundle ID
+
+**Helper Functions** (lines 819-855):
+- `FindClientIndex()`: Lookup client by ID
+- `FindFreeClientSlot()`: Find available slot in client array
+- `IsClientAllowed()`: Compare client's bundle ID with allowed list
+
+**Thread Safety:**
+- All client operations protected by `gPlugIn_StateMutex`
+- CFStringRef properly retained/released to prevent memory leaks
+
+**Debug Logging:**
+- Debug builds log client additions with bundle ID
+- Logs rejection messages when non-Spotify apps attempt to use device
+- View logs: `log stream --predicate 'process == "coreaudiod"' --level debug`
+
+**Known Limitation:**
+- macOS Sequoia (15.x) has a bug where `AudioServerPlugInClientInfo.mBundleID` is NULL
+- Filtering works on macOS 14 Sonoma and earlier
+- Waiting for Apple to fix the Sequoia bug
 
 ### Ring Buffer Architecture
 
@@ -134,6 +215,10 @@ All customization is done through `GCC_PREPROCESSOR_DEFINITIONS` at build time:
 kDriver_Name=\"CustomName\"
 kPlugIn_BundleID=\"com.example.CustomDriver\"
 kPlugIn_Icon=\"CustomIcon.icns\"
+
+# Application filtering (SpotifyHole-specific)
+kAllowedBundleID=\"com.spotify.client\"  # Default: Spotify only
+# Examples: "com.apple.Music", "com.google.Chrome", "org.videolan.vlc"
 
 # Channel configuration
 kNumber_Of_Channels=64  # 2, 16, 64, 128, 256 typical values
@@ -204,6 +289,72 @@ All AudioObject properties follow the pattern:
 3. Default values in source code
 
 ## Common Development Tasks
+
+### Testing SpotifyHole Application Filtering
+
+**Verify Spotify is allowed:**
+```bash
+# 1. Start log monitoring
+log stream --predicate 'process == "coreaudiod"' --level debug | grep -i "spotify"
+
+# 2. In another terminal: Launch Spotify
+open -a Spotify
+
+# 3. Set Spotify output to SpotifyHole 2ch (in Spotify preferences)
+
+# 4. Play music
+
+# Expected logs:
+# "BlackHole_AddDeviceClient: Added client ID=XXX, PID=XXX, Bundle=com.spotify.client"
+# "BlackHole_StartIO" (without rejection message)
+```
+
+**Verify Chrome is blocked:**
+```bash
+# 1. Launch Chrome with YouTube
+open -a "Google Chrome" https://youtube.com
+
+# 2. Change macOS system output to SpotifyHole 2ch
+
+# 3. Play YouTube video
+
+# Expected logs:
+# "BlackHole_AddDeviceClient: Added client ID=XXX, PID=XXX, Bundle=com.google.Chrome"
+# "BlackHole_StartIO: Client ID=XXX not allowed (not Spotify)"
+# IOWorkLoopDeinit: stopping with error 2003329396 (kAudioHardwareIllegalOperationError)
+```
+
+**Get application bundle ID:**
+```bash
+# Find bundle ID for any running application
+osascript -e 'id of app "ApplicationName"'
+
+# Or from app bundle
+/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" /Applications/AppName.app/Contents/Info.plist
+```
+
+### Changing Allowed Application
+
+To allow a different application (e.g., Apple Music):
+
+```bash
+# Build with different allowed bundle ID
+xcodebuild \
+  -project BlackHole.xcodeproj \
+  -configuration Debug \
+  -target BlackHole \
+  CONFIGURATION_BUILD_DIR=build \
+  CODE_SIGN_IDENTITY="" \
+  CODE_SIGNING_REQUIRED=NO \
+  PRODUCT_NAME="MusicHole" \
+  PRODUCT_BUNDLE_IDENTIFIER="audio.existential.MusicHole2ch" \
+  GCC_PREPROCESSOR_DEFINITIONS='$GCC_PREPROCESSOR_DEFINITIONS kAllowedBundleID=\"com.apple.Music\"'
+```
+
+Or edit `BlackHole/BlackHole.c` line 236 and rebuild:
+```c
+#define kAllowedBundleID "com.apple.Music"
+```
 
 ### Adding a New Control
 
